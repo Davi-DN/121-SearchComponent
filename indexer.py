@@ -6,6 +6,7 @@ from collections import defaultdict
 from bs4 import BeautifulSoup
 from nltk.stem import PorterStemmer
 from nltk.tokenize import RegexpTokenizer
+import sys
 
 from bs4 import MarkupResemblesLocatorWarning
 import warnings
@@ -144,7 +145,12 @@ def get_inverted_index(root_folder, output_path="inverted_index.json", docids_ou
     return inverted_index, doc_map
 
 def main():
-    index, doc_map = get_inverted_index("DEV/")
+    if len(sys.argv) >= 2:
+        root_folder = sys.argv[1] # "../DEV" or "/auto/.../DEV"
+    else:
+        root_folder = "DEV/"
+
+    index, doc_map = get_inverted_index(root_folder)
     return index
 
 if __name__ == "__main__":
