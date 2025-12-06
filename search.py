@@ -9,25 +9,36 @@ tokenizer = RegexpTokenizer(r'[A-Za-z0-9]+')
 stemmer = PorterStemmer()
 
 class SearchEngine:
-    def __init__(self, index_path="inverted_index.txt", lookup_path="lookup.json", docids_path="doc_ids.json"):
+    def __init__(self, index_path="inverted_index.txt", 
+                 lookup_path="lookup.json", 
+                 docids_path="doc_ids.json",
+                 pagerank_path="pagerank.json"):
+        
         print("Loading search engine...")
         t0 = time.time()
         
-        # Load the lightweight lookup table (Term -> Byte Offset)
         with open(lookup_path, "r", encoding="utf-8") as f:
             self.lookup = json.load(f)
             
-        # Load document ID mapping
         with open(docids_path, "r", encoding="utf-8") as f:
             self.doc_mapper = json.load(f)
-            # Ensure keys are ints
             self.doc_map = {int(k): v for k, v in self.doc_mapper.items()}
-            
+        
+        # Load PageRank scores
+        try:
+            with open(pagerank_path, "r", encoding="utf-8") as f:
+                pr_data = json.load(f)
+                # Ensure keys are ints and values are floats
+                self.pagerank = {int(k): v for k, v in pr_data.items()}
+            print(f"Loaded PageRank scores for {len(self.pagerank)} documents.")
+        except FileNotFoundError:
+            print("Warning: pagerank.json not found. Ranking will rely solely on TF-IDF.")
+            self.pagerank = {}
+
         self.index_path = index_path
-        # We keep the file handle open for queries
         self.index_file = open(self.index_path, "r", encoding="utf-8")
         
-        print(f"Loaded {len(self.lookup)} terms and {len(self.doc_map)} docs in {time.time()-t0:.2f}s.")
+        print(f"Ready in {time.time()-t0:.2f}s.")
 
     def __del__(self):
         if hasattr(self, 'index_file'):
@@ -46,22 +57,16 @@ class SearchEngine:
         termfreq = Counter(query_terms)
         scores = defaultdict(float)
         
-        # We process each query term
+        # 1. Calculate TF-IDF Relevance Scores
         for term, fq in termfreq.items():
-            # 1. Get offset from lookup
             offset = self.lookup.get(term)
             if offset is None:
                 continue
             
-            # 2. Seek to position in file
             self.index_file.seek(offset)
-            
-            # 3. Read and parse the line
             line = self.index_file.readline()
-            if not line:
-                continue
+            if not line: continue
                 
-            # Line format: JSON string [idf, [[doc_id, score], ...]]
             try:
                 data = json.loads(line)
                 idf = data[0]
@@ -69,27 +74,46 @@ class SearchEngine:
             except json.JSONDecodeError:
                 continue
 
-            # 4. Calculate query weight (TF-IDF for query)
             w_q = (1.0 + math.log(fq)) * idf
             
-            # 5. Accumulate scores
-            # Note: doc_info is [doc_id, tfidf_score]
             for doc_id, doc_score in postings:
                 scores[doc_id] += w_q * doc_score
 
-        # Sort and return top K
-        sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        return sorted_docs[:top_k]
+        # 2. Combine with PageRank
+        # We need to normalize or weight PageRank so it doesn't dominate or disappear.
+        # Simple approach: weighted addition.
+        # Adjust PR_WEIGHT based on how strong you want the "authority" signal to be.
+        PR_WEIGHT = 10.0 
+        
+        final_results = []
+        for doc_id, tfidf_score in scores.items():
+            pr_score = self.pagerank.get(doc_id, 0.0)
+            
+            # Hybrid Score
+            # Use log(pr) if pr values vary wildly, or just raw pr if they are normalized.
+            # PageRank sum is 1, so individual values are tiny (~1/N).
+            # We scale it up or it will be negligible compared to TF-IDF (which is usually > 1.0).
+            # Let's scale PR by N (number of docs) to make it roughly 1.0 on average.
+            
+            N = len(self.doc_map)
+            scaled_pr = pr_score * N 
+            
+            final_score = tfidf_score + (PR_WEIGHT * scaled_pr)
+            
+            final_results.append((doc_id, final_score))
+
+        # Sort
+        final_results.sort(key=lambda x: x[1], reverse=True)
+        return final_results[:top_k]
 
 def main():
     try:
         engine = SearchEngine()
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
-        print("Please run indexer.py first.")
+    except Exception as e:
+        print(f"Error initializing: {e}")
         return
 
-    print("\nOptimized Console Search. Type 'quit' to exit.\n")
+    print("\nSearch Engine with PageRank & Deduplication. Type 'quit' to exit.\n")
 
     while True:
         try:
@@ -98,9 +122,7 @@ def main():
             print("\nBye.")
             break
 
-        if not query:
-            continue
-
+        if not query: continue
         if query.lower() in {"quit", "exit", "q"}:
             print("Bye.")
             break
@@ -111,14 +133,10 @@ def main():
 
         print(f"\nFound {len(results)} results in {elapsed_ms:.1f} ms\n")
 
-        if not results:
-            print("No results.\n")
-            continue
-
         for rank, (doc_id, score) in enumerate(results, start=1):
             url = engine.doc_map.get(doc_id, f"<unknown doc {doc_id}>")
             print(f"{rank:2d}. {url}")
-            print(f"score = {score:.4f}")
+            print(f"   (Score: {score:.4f})")
         print()
 
 if __name__ == "__main__":

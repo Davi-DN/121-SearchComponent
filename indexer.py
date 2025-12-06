@@ -4,6 +4,8 @@ import math
 import sys
 import shutil
 import heapq
+import hashlib
+from urllib.parse import urlparse, urljoin
 from contextlib import ExitStack
 from collections import defaultdict
 from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
@@ -11,13 +13,14 @@ from nltk.stem import PorterStemmer
 from nltk.tokenize import RegexpTokenizer
 import warnings
 
+# Suppress BS4 warnings
 warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
 tokenizer = RegexpTokenizer(r'[A-Za-z0-9]+')
 stemmer = PorterStemmer()
 
 # Configuration
-BLOCK_SIZE = 2000  # Number of documents to process before dumping to disk
+BLOCK_SIZE = 2000
 WEIGHTS = {
     "title": 3.0, 
     "h1": 2.5, 
@@ -27,16 +30,110 @@ WEIGHTS = {
     "normal": 1.0
 }
 
+class SimHash:
+    def __init__(self, threshold=3):
+        self.seen_fingerprints = set()
+        self.threshold = threshold  # max Hamming distance for near-duplicates
+
+    def _hash_func(self, token):
+        # Returns a stable 64-bit hash
+        return int(hashlib.md5(token.encode("utf-8")).hexdigest(), 16)
+
+    def compute(self, token_weights):
+        """
+        Computes 64-bit SimHash fingerprint for a dictionary of {token: weight}.
+        """
+        v = [0] * 64
+        for token, weight in token_weights.items():
+            h = self._hash_func(token)
+            for i in range(64):
+                if h & (1 << i):
+                    v[i] += weight
+                else:
+                    v[i] -= weight
+        
+        fingerprint = 0
+        for i in range(64):
+            if v[i] > 0:
+                fingerprint |= (1 << i)
+        return fingerprint
+
+    def _hamming_distance(self, a, b):
+        return (a ^ b).bit_count()
+
+    def is_duplicate(self, fingerprint):
+        """
+        Returns True if a near-duplicate (Hamming distance <= threshold)
+        has been seen before.
+        """
+        for fp in self.seen_fingerprints:
+            if self._hamming_distance(fp, fingerprint) <= self.threshold:
+                return True
+
+        self.seen_fingerprints.add(fingerprint)
+        return False
+
+def compute_pagerank(adjacency_list, doc_map_rev, num_docs, iterations=20, d=0.85):
+    """
+    Computes PageRank using the iterative power method.
+    """
+    print(f"Computing PageRank for {num_docs} documents...")
+
+    # 1. Convert URL graph to DocID graph: {source_id: [target_id, ...]}
+    link_structure = defaultdict(list)
+    
+    for source_url, targets in adjacency_list.items():
+        if source_url not in doc_map_rev:
+            continue
+        source_id = doc_map_rev[source_url]
+        
+        for t_url in targets:
+            if t_url in doc_map_rev:
+                if t_url != source_url: 
+                    target_id = doc_map_rev[t_url]
+                    link_structure[source_id].append(target_id)
+
+    # 2. Initialize PageRank
+    pr = {i: 1.0 / num_docs for i in range(num_docs)}
+    
+    # 3. Iteration
+    for _ in range(iterations):
+        new_pr = {i: 0.0 for i in range(num_docs)}
+        sink_pr = 0.0
+        
+        # Calculate sink mass
+        for i in range(num_docs):
+            if i not in link_structure or not link_structure[i]:
+                sink_pr += pr[i]
+        
+        # Distribute flow
+        for source_id, targets in link_structure.items():
+            share = pr[source_id] / len(targets)
+            for target_id in targets:
+                new_pr[target_id] += share
+        
+        # Apply damping factor and sink mass
+        base_mass = (1.0 - d) / num_docs
+        sink_mass = (d * sink_pr) / num_docs
+        total_added = base_mass + sink_mass
+
+        for i in range(num_docs):
+            new_pr[i] = (new_pr[i] * d) + total_added
+            
+        pr = new_pr
+
+    return pr
+
 def check_if_xml(input_content):
     content_start = input_content.lstrip()[:100].lower()
     return content_start.startswith("<?xml") or ("<" in content_start and "/>" in content_start)
 
-def extract_tokens(html):
+def parse_html(html):
     if check_if_xml(html):
-        soup = BeautifulSoup(html, features="xml")
-    else:
-        soup = BeautifulSoup(html, "html.parser")
+        return BeautifulSoup(html, features="xml")
+    return BeautifulSoup(html, "html.parser")
 
+def extract_content(soup):
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
 
@@ -65,43 +162,51 @@ def extract_tokens(html):
 
     return freq
 
+def extract_links(soup, base_url):
+    """
+    Extracts absolute URLs from the document.
+    Includes error handling for malformed URLs/IPv6 addresses.
+    """
+    links = set()
+    for tag in soup.find_all("a", href=True):
+        href = tag["href"]
+        try:
+            # urljoin can fail on malformed IPv6 brackets or weird characters
+            full_url = urljoin(base_url, href)
+            
+            # urlparse can also fail
+            parsed = urlparse(full_url)
+            
+            clean_url = parsed.scheme + "://" + parsed.netloc + parsed.path
+            if parsed.query:
+                clean_url += "?" + parsed.query
+            
+            # Keep only web links
+            if clean_url.startswith("http"):
+                links.add(clean_url)
+                
+        except (ValueError, Exception):
+            # Skip any malformed links
+            continue
+            
+    return list(links)
+
 def write_partial_index(partial_index, block_num, output_dir="temp_indices"):
-    """
-    Writes a partial index to disk.
-    Format: term|doc_id:tf;doc_id:tf;...
-    """
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    
     filename = os.path.join(output_dir, f"part_{block_num}.txt")
-    
-    # Sort terms to allow for efficient merging later
     sorted_terms = sorted(partial_index.keys())
-    
     with open(filename, "w", encoding="utf-8") as f:
         for term in sorted_terms:
-            postings = partial_index[term] # list of (doc_id, tf)
-            # Serialize postings to string
-            postings_str = ";".join([f"{did}:{tf:.2f}" for did, tf in postings])
+            postings_str = ";".join([f"{did}:{tf:.2f}" for did, tf in partial_index[term]])
             f.write(f"{term}|{postings_str}\n")
-            
     return filename
 
 def merge_indices(temp_files, output_path, lookup_path, N):
-    """
-    Merges multiple sorted partial index files into one final index.
-    Calculates TF-IDF on the fly.
-    """
     print(f"Merging {len(temp_files)} partial indices...")
-    
-    # Open all temp files
     with ExitStack() as stack:
         files = [stack.enter_context(open(fn, "r", encoding="utf-8")) for fn in temp_files]
-        
-        # Priority queue for merging: (term, file_index, line_content)
         heap = []
-        
-        # Initialize heap with first line from each file
         for i, f in enumerate(files):
             line = f.readline()
             if line:
@@ -112,52 +217,34 @@ def merge_indices(temp_files, output_path, lookup_path, N):
         lookup = {}
         
         current_term = None
-        current_postings = [] # List of (doc_id, tf)
+        current_postings = []
         
         while heap:
             term, file_idx, content = heapq.heappop(heap)
-            
-            # If we see a new term, process the previous accumulated term
             if current_term is not None and term != current_term:
-                # 1. Calculate stats
                 df = len(current_postings)
                 idf = math.log(N / df) if df > 0 else 0
-                
-                # 2. Build final postings with TF-IDF scores
                 final_postings = []
                 for doc_id, tf in current_postings:
-                    # Log-frequency weighting
                     w_d = (1 + math.log(tf))
                     score = w_d * idf
                     final_postings.append([doc_id, score])
                 
-                # 3. Write to file
-                # Save current file position for lookup
                 offset = final_index.tell()
                 lookup[current_term] = offset
-                
-                # Format: JSON list for easy parsing: [idf, [[doc_id, score], ...]]
-                # We store IDF in the file so searcher doesn't need to recalculate it
-                data = json.dumps([idf, final_postings])
-                final_index.write(data + "\n")
-                
-                # Reset for new term
+                final_index.write(json.dumps([idf, final_postings]) + "\n")
                 current_postings = []
 
             current_term = term
-            
-            # Parse the content from the temp file (doc_id:tf;doc_id:tf)
             for item in content.split(";"):
-                doc_id_str, tf_str = item.split(":")
-                current_postings.append((int(doc_id_str), float(tf_str)))
+                d_str, tf_str = item.split(":")
+                current_postings.append((int(d_str), float(tf_str)))
             
-            # Read next line from the file that supplied the current term
             next_line = files[file_idx].readline()
             if next_line:
-                next_term, next_content = next_line.strip().split("|", 1)
-                heapq.heappush(heap, (next_term, file_idx, next_content))
+                nt, nc = next_line.strip().split("|", 1)
+                heapq.heappush(heap, (nt, file_idx, nc))
         
-        # Process the very last term
         if current_term is not None and current_postings:
             df = len(current_postings)
             idf = math.log(N / df) if df > 0 else 0
@@ -166,91 +253,91 @@ def merge_indices(temp_files, output_path, lookup_path, N):
                 w_d = (1 + math.log(tf))
                 score = w_d * idf
                 final_postings.append([doc_id, score])
-            
             offset = final_index.tell()
             lookup[current_term] = offset
-            data = json.dumps([idf, final_postings])
-            final_index.write(data + "\n")
+            final_index.write(json.dumps([idf, final_postings]) + "\n")
 
         final_index.close()
-        
-        # Save lookup table
         with open(lookup_path, "w", encoding="utf-8") as f:
             json.dump(lookup, f)
-            
     print("Merge complete.")
 
 def get_inverted_index(root_folder):
-    doc_map = {}
-    doc_count = 0
+    doc_map = {}      
+    doc_map_rev = {}  
+    adjacency_list = {} 
     
     partial_index = defaultdict(list)
     temp_files = []
+    
+    simhasher = SimHash()
+    doc_count = 0
+    duplicates = 0
     block_num = 0
     
-    print("Indexing documents...")
+    print("Indexing documents with SimHash duplicate detection...")
+    
     for dirpath, _, filenames in os.walk(root_folder):
         for filename in filenames:
-            if not filename.endswith(".json"):
-                continue
-
+            if not filename.endswith(".json"): continue
             file_path = os.path.join(dirpath, filename)
             
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            except:
-                continue
+            except: continue
 
+            # Use file_path if url is missing, but prefer 'url'
             url = data.get("url", file_path)
             html = data.get("content", "")
 
+            soup = parse_html(html)
+            tokens = extract_content(soup)
+            
+            if not tokens:
+                continue
+
+            fingerprint = simhasher.compute(tokens)
+            if simhasher.is_duplicate(fingerprint):
+                duplicates += 1
+                continue 
+            
             doc_id = doc_count
-            doc_map[doc_id] = url
             doc_count += 1
+            doc_map[doc_id] = url
+            doc_map_rev[url] = doc_id
 
-            # Extract tokens
-            tokens = extract_tokens(html)
+            out_links = extract_links(soup, url)
+            adjacency_list[url] = out_links
 
-            # Add to partial index
             for token, tf in tokens.items():
                 partial_index[token].append((doc_id, tf))
             
-            # Check if block size exceeded
             if doc_count % BLOCK_SIZE == 0:
-                print(f"  Processed {doc_count} docs. Dumping block {block_num}...")
-                temp_file = write_partial_index(partial_index, block_num)
-                temp_files.append(temp_file)
-                partial_index.clear() # Free memory
+                print(f"  Processed {doc_count} docs. (Duplicates skipped: {duplicates})")
+                temp_files.append(write_partial_index(partial_index, block_num))
+                partial_index.clear()
                 block_num += 1
 
-    # Dump remaining documents
     if partial_index:
-        print(f"  Dumping final block {block_num}...")
-        temp_file = write_partial_index(partial_index, block_num)
-        temp_files.append(temp_file)
+        temp_files.append(write_partial_index(partial_index, block_num))
         partial_index.clear()
 
-    # Save doc_ids map
+    print(f"Total Unique Docs: {doc_count}. Duplicates removed: {duplicates}")
+
     with open("doc_ids.json", "w", encoding="utf-8") as f:
         json.dump(doc_map, f, indent=2)
 
-    # Merge all partial indices
+    pagerank_scores = compute_pagerank(adjacency_list, doc_map_rev, doc_count)
+    
+    with open("pagerank.json", "w", encoding="utf-8") as f:
+        json.dump(pagerank_scores, f, indent=2)
+
     if temp_files:
         merge_indices(temp_files, "inverted_index.txt", "lookup.json", doc_count)
-        
-        # Cleanup temp files
         shutil.rmtree("temp_indices", ignore_errors=True)
     else:
         print("No documents found.")
-
-    # Report
-    index_size = os.path.getsize("inverted_index.txt") / (1024 * 1024)
-    lookup_size = os.path.getsize("lookup.json") / (1024 * 1024)
-    print("\nReport:")
-    print(f"Total Documents: {doc_count}")
-    print(f"Index File Size: {index_size:.2f} MB")
-    print(f"Lookup File Size: {lookup_size:.2f} MB")
 
 def main():
     root_folder = sys.argv[1] if len(sys.argv) >= 2 else "DEV/"
