@@ -95,14 +95,14 @@ def extract_tokens(html):
 
 
 def create_partial_index(part_index, run_number, output_dir):
-    path = os.path.join(output_dir, f"partial_idx_{run_number}.json")
+    path = os.path.join(output_dir, f"partial_idx_{run_number}.jsonl")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(part_index, f)
 
     part_index.clear()
     return path
 
-def merge_partial_indexes(partial_idx_paths, final_output):
+def merge_partial_indexes(partial_idx_paths, final_output, idx_to_idx_file="idx_to_idx.json"):
     final_index = defaultdict(dict)
 
     for path in partial_idx_paths:
@@ -127,9 +127,25 @@ def merge_partial_indexes(partial_idx_paths, final_output):
     with open(final_output, "w", encoding="utf-8") as f:
         json.dump(inverted, f, indent=2)
 
+
+
+    os.makedirs(os.path.dirname(final_output) or ".", exist_ok=True)
+    idx_to_idx = {}
+    offset = 0
+    with open(final_output, "wb") as f:
+        for term, entry in inverted.items():
+            line = json.dumps({term: entry}) + "\n"
+            line_bytes = line.encode("utf-8")
+            f.write(line_bytes)
+            idx_to_idx[term] = offset
+            offset += len(line_bytes)
+
+    with open(idx_to_idx_file, "w", encoding="utf-8") as f:
+        json.dump(idx_to_idx, f)    
+
     return inverted
 
-def get_inverted_index(root_folder, output_path="inverted_index.json", docids_output="doc_ids.json", partial_idxs_folder="partial_indexes"):
+def get_inverted_index(root_folder, output_path="inverted_index.jsonl", docids_output="doc_ids.json", partial_idxs_folder="partial_indexes"):
     # {doc_id: tf}
     os.makedirs(partial_idxs_folder, exist_ok=True)
     doc_map = {}
@@ -168,13 +184,6 @@ def get_inverted_index(root_folder, output_path="inverted_index.json", docids_ou
                 run += 1
 
             doc_id += 1
-
-            """
-            for token, count in tokens.items():
-                term_posting[token][doc_id] = count
-
-
-            """
 
     if mem_idx:
         partial_path = create_partial_index(mem_idx, run, partial_idxs_folder)
