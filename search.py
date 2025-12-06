@@ -8,82 +8,88 @@ from nltk.tokenize import RegexpTokenizer
 tokenizer = RegexpTokenizer(r'[A-Za-z0-9]+')
 stemmer = PorterStemmer()
 
-def load_index(index_path="inverted_index.json", docids_path="doc_ids.json"):
-    print("Loading index into memory (simple version)...")
+class SearchEngine:
+    def __init__(self, index_path="inverted_index.txt", lookup_path="lookup.json", docids_path="doc_ids.json"):
+        print("Loading search engine...")
+        t0 = time.time()
+        
+        # Load the lightweight lookup table (Term -> Byte Offset)
+        with open(lookup_path, "r", encoding="utf-8") as f:
+            self.lookup = json.load(f)
+            
+        # Load document ID mapping
+        with open(docids_path, "r", encoding="utf-8") as f:
+            self.doc_mapper = json.load(f)
+            # Ensure keys are ints
+            self.doc_map = {int(k): v for k, v in self.doc_mapper.items()}
+            
+        self.index_path = index_path
+        # We keep the file handle open for queries
+        self.index_file = open(self.index_path, "r", encoding="utf-8")
+        
+        print(f"Loaded {len(self.lookup)} terms and {len(self.doc_map)} docs in {time.time()-t0:.2f}s.")
 
-    # becomes a python dict inverted_index with df and postings
-    with open(index_path, "r", encoding="utf-8") as f:
-        inverted_index = json.load(f)
+    def __del__(self):
+        if hasattr(self, 'index_file'):
+            self.index_file.close()
 
-    # loads object with string keys
-    with open(docids_path, "r", encoding="utf-8") as f:
-        doc_mapper = json.load(f)
+    def preprocess_query(self, query: str):
+        tokens = tokenizer.tokenize(query.lower())
+        stems = [stemmer.stem(tok) for tok in tokens]
+        return stems
 
-    # convert json string keys to ints
-    doc_map = {int(k): v for k, v in doc_mapper.items()}
-    N = len(doc_map)
-    print(f"Loaded {len(inverted_index)} terms and {N} documents.")
-    return inverted_index, doc_map, N
-
-def preprocess_query(query: str):
-    # all the stemmed tokens in a list 
-    tokens = tokenizer.tokenize(query.lower())
-    stems = [stemmer.stem(tok) for tok in tokens]
-    return stems
-
-def search(query, inverted_index, doc_map, N, top_k=20):
-    # list of stems
-    query_terms = preprocess_query(query)
-    if not query_terms:
-        return []
-    
-    # dict of term counter
-    termfreq = Counter(query_terms)
-    # stores total tf-idf style score for that doc
-    scores = defaultdict(float)
-    for term, fq in termfreq.items():
-        if term not in inverted_index:
-            continue
-
-        entry = inverted_index[term]
-        df = entry["df"] # number of documents with the term
-        postings = entry["postings"] # list of doc_id, tf, etc.
-
-        if df == 0:
-            continue
-
-        # log(N/df) -> less frequent terms get bigger idf
-        # rare terms have more impact like "simhash" compared to "uci"
-        idf = math.log(N / df)
-
-        # query term weight
-        # multiply how often it appears *
-        w_q = (1.0 + math.log(fq)) * idf
-
-        # loop over all with the term
-        for posting in postings:
-            doc_id = posting["doc_id"]
-            tf_doc = posting["tf"]
-
-            # safety reasons, shouldn't go lower than 0.
-            if tf_doc <= 0:
+    def search(self, query, top_k=20):
+        query_terms = self.preprocess_query(query)
+        if not query_terms:
+            return []
+        
+        termfreq = Counter(query_terms)
+        scores = defaultdict(float)
+        
+        # We process each query term
+        for term, fq in termfreq.items():
+            # 1. Get offset from lookup
+            offset = self.lookup.get(term)
+            if offset is None:
+                continue
+            
+            # 2. Seek to position in file
+            self.index_file.seek(offset)
+            
+            # 3. Read and parse the line
+            line = self.index_file.readline()
+            if not line:
+                continue
+                
+            # Line format: JSON string [idf, [[doc_id, score], ...]]
+            try:
+                data = json.loads(line)
+                idf = data[0]
+                postings = data[1]
+            except json.JSONDecodeError:
                 continue
 
-            # weight of document term
-            # term-frequency * idf for classic weighting
-            w_d = (1.0 + math.log(tf_doc)) * idf
-            scores[doc_id] += w_q * w_d
+            # 4. Calculate query weight (TF-IDF for query)
+            w_q = (1.0 + math.log(fq)) * idf
+            
+            # 5. Accumulate scores
+            # Note: doc_info is [doc_id, tfidf_score]
+            for doc_id, doc_score in postings:
+                scores[doc_id] += w_q * doc_score
 
-    # sort docs in descending order
-    sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-
-    # return top_k list of (doc_id, score) which is 20 right now
-    return sorted_docs[:top_k]
+        # Sort and return top K
+        sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return sorted_docs[:top_k]
 
 def main():
-    inverted_index, doc_map, N = load_index()
+    try:
+        engine = SearchEngine()
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        print("Please run indexer.py first.")
+        return
 
-    print("\nSimple console search. Type 'quit' or 'exit' to stop.\n")
+    print("\nOptimized Console Search. Type 'quit' to exit.\n")
 
     while True:
         try:
@@ -99,9 +105,8 @@ def main():
             print("Bye.")
             break
 
-        # timing the search
         t0 = time.time()
-        results = search(query, inverted_index, doc_map, N, top_k=20)
+        results = engine.search(query, top_k=20)
         elapsed_ms = (time.time() - t0) * 1000
 
         print(f"\nFound {len(results)} results in {elapsed_ms:.1f} ms\n")
@@ -110,13 +115,11 @@ def main():
             print("No results.\n")
             continue
 
-        # prints results
         for rank, (doc_id, score) in enumerate(results, start=1):
-            url = doc_map.get(doc_id, f"<unknown doc {doc_id}>")
+            url = engine.doc_map.get(doc_id, f"<unknown doc {doc_id}>")
             print(f"{rank:2d}. {url}")
             print(f"score = {score:.4f}")
         print()
-
 
 if __name__ == "__main__":
     main()
