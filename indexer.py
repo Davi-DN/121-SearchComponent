@@ -29,7 +29,7 @@ WEIGHTS = {
 }
 
 class SimHash:
-    def __init__(self, threshold=3):
+    def __init__(self, threshold=1):
         self.seen_fingerprints = set()
         self.threshold = threshold  # max Hamming distance for near-duplicates
 
