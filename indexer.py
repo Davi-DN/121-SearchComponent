@@ -29,7 +29,7 @@ WEIGHTS = {
 }
 
 class SimHash:
-    def __init__(self, threshold=1):
+    def __init__(self, threshold=3):
         self.seen_fingerprints = set()
         self.threshold = threshold  # max Hamming distance for near-duplicates
 
@@ -115,9 +115,12 @@ def parse_html(html):
 def extract_content(soup):
     for tag in soup(["script", "style", "noscript"]): tag.decompose()
     freq = defaultdict(float)
+    
     def process(text, weight):
         if not text: return
         for token in tokenizer.tokenize(text.lower()):
+            # Removed STOP_WORDS check
+            if len(token) < 2: continue  # Still skip single characters (optional)
             stem = stemmer.stem(token)
             freq[stem] += weight
 
@@ -125,6 +128,7 @@ def extract_content(soup):
     for tag_name, w in [("h1", WEIGHTS["h1"]), ("h2", WEIGHTS["h2"]), ("h3", WEIGHTS["h3"])]:
         for tag in soup.find_all(tag_name): process(tag.get_text(separator=" "), w)
     for tag in soup.find_all(["b", "strong"]): process(tag.get_text(separator=" "), WEIGHTS["bold"])
+    
     skip_tags = {"title", "h1", "h2", "h3", "b", "strong", "script", "style", "noscript"}
     for item in soup.find_all(string=True):
         if item.parent and item.parent.name and item.parent.name.lower() not in skip_tags:
@@ -167,9 +171,6 @@ def merge_indices(temp_files, output_path, lookup_path, N):
         
         final_index = open(output_path, "w", encoding="utf-8")
         lookup = {}
-        
-        # Dictionary to store the sum of squares of weights for each doc
-        # used for cosine similarity normalization
         doc_norms = defaultdict(float)
 
         current_term = None
@@ -179,16 +180,13 @@ def merge_indices(temp_files, output_path, lookup_path, N):
             term, file_idx, content = heapq.heappop(heap)
             if current_term is not None and term != current_term:
                 df = len(current_postings)
-                idf = math.log(N / df) if df > 0 else 0
+                idf = math.log10(N / df) if df > 0 else 0
+                
                 final_postings = []
                 for doc_id, tf in current_postings:
-                    # TF-IDF Weight Calculation
-                    w_d = (1 + math.log(tf))
+                    w_d = (1 + math.log10(tf))
                     score = w_d * idf
-                    
-                    # Accumulate sum of squares for vector magnitude
                     doc_norms[doc_id] += score ** 2
-                    
                     final_postings.append([doc_id, score])
                 
                 offset = final_index.tell()
@@ -206,13 +204,12 @@ def merge_indices(temp_files, output_path, lookup_path, N):
                 nt, nc = next_line.strip().split("|", 1)
                 heapq.heappush(heap, (nt, file_idx, nc))
         
-        # Handle last term
         if current_term is not None and current_postings:
             df = len(current_postings)
-            idf = math.log(N / df) if df > 0 else 0
+            idf = math.log10(N / df) if df > 0 else 0
             final_postings = []
             for doc_id, tf in current_postings:
-                w_d = (1 + math.log(tf))
+                w_d = (1 + math.log10(tf))
                 score = w_d * idf
                 doc_norms[doc_id] += score ** 2
                 final_postings.append([doc_id, score])
@@ -223,14 +220,12 @@ def merge_indices(temp_files, output_path, lookup_path, N):
 
         final_index.close()
         
-        # Save lookup
-        with open(lookup_path, "w", encoding="utf-8") as f: 
-            json.dump(lookup, f)
-            
-        # Compute Sqrt and save Doc Norms
         final_norms = {k: math.sqrt(v) for k, v in doc_norms.items()}
         with open("doc_norms.json", "w", encoding="utf-8") as f:
             json.dump(final_norms, f)
+
+        with open(lookup_path, "w", encoding="utf-8") as f:
+            json.dump(lookup, f)
             
     print("Merge complete.")
 

@@ -7,7 +7,6 @@ from collections import Counter, defaultdict
 from nltk.stem import PorterStemmer
 from nltk.tokenize import RegexpTokenizer
 
-# Try importing Flask for the web server
 try:
     from flask import Flask, request, render_template_string
 except ImportError:
@@ -26,35 +25,36 @@ class SearchEngine:
         print("Loading search engine...")
         t0 = time.time()
         
-        # Load Lookup Table
         if not os.path.exists(lookup_path):
             raise FileNotFoundError(f"{lookup_path} not found! Run indexer.py first.")
-
+        
         with open(lookup_path, "r", encoding="utf-8") as f:
             self.lookup = json.load(f)
             
-        # Load Document ID Map
         with open(docids_path, "r", encoding="utf-8") as f:
             self.doc_mapper = json.load(f)
             self.doc_map = {int(k): v for k, v in self.doc_mapper.items()}
         
-        # Load PageRank Scores
         try:
             with open(pagerank_path, "r", encoding="utf-8") as f:
                 pr_data = json.load(f)
                 self.pagerank = {int(k): v for k, v in pr_data.items()}
-            print(f"Loaded PageRank for {len(self.pagerank)} docs.")
         except FileNotFoundError:
-            print("Warning: pagerank.json not found. Ranking will rely on TF-IDF/Cosine.")
             self.pagerank = {}
 
-        # Load Document Norms (for Cosine Similarity)
+        if self.pagerank:
+            self.pr_min = min(self.pagerank.values())
+            self.pr_max = max(self.pagerank.values())
+        else:
+            self.pr_min = 0.0
+            self.pr_max = 1.0
+
         try:
             with open(norms_path, "r", encoding="utf-8") as f:
                 norms_data = json.load(f)
                 self.doc_norms = {int(k): v for k, v in norms_data.items()}
         except FileNotFoundError:
-            print("Warning: doc_norms.json not found. Cosine similarity will not be normalized.")
+            print("Warning: doc_norms.json not found. Scores will not be normalized (Cosine disabled).")
             self.doc_norms = {}
 
         self.index_path = index_path
@@ -67,25 +67,22 @@ class SearchEngine:
             self.index_file.close()
 
     def preprocess_query(self, query: str):
-        # Tokenize and stem
         tokens = tokenizer.tokenize(query.lower())
         stems = [stemmer.stem(tok) for tok in tokens]
         return stems
 
     def search(self, query, top_k=20):
+        # 1. Preprocess query
         query_terms = self.preprocess_query(query)
         if not query_terms:
             return []
 
         termfreq = Counter(query_terms)
-        scores = defaultdict(float)
-
-        # For soft conjunction
-        match_counts = defaultdict(int)
-
-        # Query norm accumulator
+        scores = defaultdict(float)        # dot products (query ⋅ doc)
+        term_matches = defaultdict(int)    # distinct query terms matched per doc
         query_norm_sq = 0.0
 
+        # 2. Build query vector and accumulate doc dot products
         for term, fq in termfreq.items():
             offset = self.lookup.get(term)
             if offset is None:
@@ -98,45 +95,101 @@ class SearchEngine:
 
             try:
                 idf, postings = json.loads(line)
-            except:
+            except json.JSONDecodeError:
                 continue
 
-            # MUST match index formula:
-            # w_q = (1 + log(tf_q)) * idf
-            w_q = (1.0 + math.log(fq)) * idf
+            if not postings:
+                continue
+
+            # Query weight: w_q = (1 + log10(tf_q)) * idf
+            w_q = (1.0 + math.log10(fq)) * idf
             query_norm_sq += w_q * w_q
 
-            for doc_id, w_d in postings:   # w_d is already TF-IDF from index
-                scores[doc_id] += w_q * w_d     # dot product
-                match_counts[doc_id] += 1
+            for doc_id, doc_weight in postings:
+                scores[doc_id] += w_q * doc_weight
+                term_matches[doc_id] += 1  # +1 distinct query term matched
 
-        query_norm = math.sqrt(query_norm_sq)
-        results = []
+        if not scores:
+            return []
 
-        for doc_id, dot in scores.items():
-            d_norm = self.doc_norms.get(doc_id, 0.0)
+        query_norm = math.sqrt(query_norm_sq) if query_norm_sq > 0 else 0.0
+        num_query_terms = len(termfreq)
 
-            if d_norm > 0 and query_norm > 0:
-                cosine = dot / (query_norm * d_norm)
+        # PR: tiny tie-breaker
+        PR_WEIGHT = 0.02
+
+        # Soft-conjunction mixing between cosine and coverage:
+        # final ~ cosine * ( (1 - LAMBDA) + LAMBDA * coverage )
+        # LAMBDA close to 1: strong preference for docs that match many terms
+        # LAMBDA close to 0: almost pure cosine
+        LAMBDA = 0.7
+
+        # Small extra bump for coverage so docs that match more terms get a slight additive bonus too
+        COVERAGE_BONUS = 0.05
+
+        candidates = []
+
+        for doc_id, dot_product in scores.items():
+            doc_norm = self.doc_norms.get(doc_id, 0.0)
+
+            # Cosine similarity
+            if doc_norm > 0 and query_norm > 0:
+                cosine_sim = dot_product / (query_norm * doc_norm)
             else:
-                cosine = 0.0
+                cosine_sim = 0.0
 
-            # Soft conjunction boost (your previous logic)
-            soft = match_counts[doc_id] * 0.25
+            # Drop only truly negligible matches
+            if cosine_sim <= 0.0:
+                continue
 
-            # PageRank
-            pr = self.pagerank.get(doc_id, 0.0) * len(self.doc_norms) * 10.0
+            # Coverage: fraction of DISTINCT query terms matched
+            if num_query_terms > 0:
+                coverage = term_matches[doc_id] / num_query_terms
+            else:
+                coverage = 0.0
 
-            final_score = cosine + soft + pr
-            results.append((doc_id, final_score))
+            # Normalized PageRank (self.pr_min / self.pr_max computed in __init__)
+            raw_pr = self.pagerank.get(doc_id, 0.0)
+            if self.pr_max > self.pr_min:
+                pr_norm = (raw_pr - self.pr_min) / (self.pr_max - self.pr_min)
+            else:
+                pr_norm = 0.0
 
-        results.sort(key=lambda x: -x[1])
-        return results[:top_k]
+            # Soft conjunction
+            mix = (1.0 - LAMBDA) + LAMBDA * coverage
+            soft_cosine = cosine_sim * mix
+
+            final_score = (
+                soft_cosine
+                + COVERAGE_BONUS * coverage
+                + PR_WEIGHT * pr_norm
+            )
+
+            # URL-based heuristics
+            url = self.doc_map.get(doc_id, "").lower()
+
+            # Downweight intranet/login pages (gateway noise)
+            if "login" in url or "please+login" in url:
+                final_score *= 0.05
+            elif "intranet.ics.uci.edu" in url:
+                final_score *= 0.2
+
+            # Downweight photo-gallery pages
+            if "/pix/" in url:
+                final_score *= 0.25
+
+            candidates.append((doc_id, final_score))
+
+        # 3. Sort and return top-k
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates[:top_k]
+
+
 
 
 def run_web(port=8080):
     if Flask is None:
-        print("Error: Flask is not installed. Please run: pip install flask")
+        print("Error: Flask is not installed.")
         return
 
     try:
