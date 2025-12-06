@@ -119,8 +119,6 @@ def extract_content(soup):
     def process(text, weight):
         if not text: return
         for token in tokenizer.tokenize(text.lower()):
-            # Removed STOP_WORDS check
-            if len(token) < 2: continue  # Still skip single characters (optional)
             stem = stemmer.stem(token)
             freq[stem] += weight
 
